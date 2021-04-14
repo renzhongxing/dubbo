@@ -19,6 +19,7 @@ package org.apache.dubbo.common.extension;
 import org.apache.dubbo.common.URL;
 import org.apache.dubbo.common.context.Lifecycle;
 import org.apache.dubbo.common.extension.support.ActivateComparator;
+import org.apache.dubbo.common.extension.support.WrapperComparator;
 import org.apache.dubbo.common.lang.Prioritized;
 import org.apache.dubbo.common.logger.Logger;
 import org.apache.dubbo.common.logger.LoggerFactory;
@@ -47,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -258,6 +260,8 @@ public class ExtensionLoader<T> {
      */
     public List<T> getActivateExtension(URL url, String[] values, String group) {
         List<T> activateExtensions = new ArrayList<>();
+        // solve the bug of using @SPI's wrapper method to report a null pointer exception.
+        TreeMap<Class, T> activateExtensionsMap = new TreeMap<>(ActivateComparator.COMPARATOR);
         List<String> names = values == null ? new ArrayList<>(0) : asList(values);
         if (!names.contains(REMOVE_VALUE_PREFIX + DEFAULT_KEY)) {
             getExtensionClasses();
@@ -280,10 +284,12 @@ public class ExtensionLoader<T> {
                         && !names.contains(name)
                         && !names.contains(REMOVE_VALUE_PREFIX + name)
                         && isActive(activateValue, url)) {
-                    activateExtensions.add(getExtension(name));
+                    activateExtensionsMap.put(getExtensionClass(name), getExtension(name));
                 }
             }
-            activateExtensions.sort(ActivateComparator.COMPARATOR);
+            if(!activateExtensionsMap.isEmpty()){
+                activateExtensions.addAll(activateExtensionsMap.values());
+            }
         }
         List<T> loadedExtensions = new ArrayList<>();
         for (int i = 0; i < names.size(); i++) {
@@ -409,6 +415,10 @@ public class ExtensionLoader<T> {
      */
     @SuppressWarnings("unchecked")
     public T getExtension(String name) {
+        return getExtension(name, true);
+    }
+
+    public T getExtension(String name, boolean wrap) {
         if (StringUtils.isEmpty(name)) {
             throw new IllegalArgumentException("Extension name == null");
         }
@@ -421,7 +431,7 @@ public class ExtensionLoader<T> {
             synchronized (holder) {
                 instance = holder.get();
                 if (instance == null) {
-                    instance = createExtension(name);
+                    instance = createExtension(name, wrap);
                     holder.set(instance);
                 }
             }
@@ -594,32 +604,31 @@ public class ExtensionLoader<T> {
     }
 
     private IllegalStateException findException(String name) {
-        for (Map.Entry<String, IllegalStateException> entry : exceptions.entrySet()) {
-            if (entry.getKey().toLowerCase().contains(name.toLowerCase())) {
-                return entry.getValue();
-            }
-        }
         StringBuilder buf = new StringBuilder("No such extension " + type.getName() + " by name " + name);
-
 
         int i = 1;
         for (Map.Entry<String, IllegalStateException> entry : exceptions.entrySet()) {
-            if (i == 1) {
-                buf.append(", possible causes: ");
+            if (entry.getKey().toLowerCase().startsWith(name.toLowerCase())) {
+                if (i == 1) {
+                    buf.append(", possible causes: ");
+                }
+                buf.append("\r\n(");
+                buf.append(i++);
+                buf.append(") ");
+                buf.append(entry.getKey());
+                buf.append(":\r\n");
+                buf.append(StringUtils.toString(entry.getValue()));
             }
+        }
 
-            buf.append("\r\n(");
-            buf.append(i++);
-            buf.append(") ");
-            buf.append(entry.getKey());
-            buf.append(":\r\n");
-            buf.append(StringUtils.toString(entry.getValue()));
+        if (i == 1) {
+            buf.append(", no related exception was found, please check whether related SPI module is missing.");
         }
         return new IllegalStateException(buf.toString());
     }
 
     @SuppressWarnings("unchecked")
-    private T createExtension(String name) {
+    private T createExtension(String name, boolean wrap) {
         Class<?> clazz = getExtensionClasses().get(name);
         if (clazz == null) {
             throw findException(name);
@@ -627,16 +636,32 @@ public class ExtensionLoader<T> {
         try {
             T instance = (T) EXTENSION_INSTANCES.get(clazz);
             if (instance == null) {
-                EXTENSION_INSTANCES.putIfAbsent(clazz, clazz.newInstance());
+                EXTENSION_INSTANCES.putIfAbsent(clazz, clazz.getDeclaredConstructor().newInstance());
                 instance = (T) EXTENSION_INSTANCES.get(clazz);
             }
             injectExtension(instance);
-            Set<Class<?>> wrapperClasses = cachedWrapperClasses;
-            if (CollectionUtils.isNotEmpty(wrapperClasses)) {
-                for (Class<?> wrapperClass : wrapperClasses) {
-                    instance = injectExtension((T) wrapperClass.getConstructor(type).newInstance(instance));
+
+
+            if (wrap) {
+
+                List<Class<?>> wrapperClassesList = new ArrayList<>();
+                if (cachedWrapperClasses != null) {
+                    wrapperClassesList.addAll(cachedWrapperClasses);
+                    wrapperClassesList.sort(WrapperComparator.COMPARATOR);
+                    Collections.reverse(wrapperClassesList);
+                }
+
+                if (CollectionUtils.isNotEmpty(wrapperClassesList)) {
+                    for (Class<?> wrapperClass : wrapperClassesList) {
+                        Wrapper wrapper = wrapperClass.getAnnotation(Wrapper.class);
+                        if (wrapper == null
+                                || (ArrayUtils.contains(wrapper.matches(), name) && !ArrayUtils.contains(wrapper.mismatches(), name))) {
+                            instance = injectExtension((T) wrapperClass.getConstructor(type).newInstance(instance));
+                        }
+                    }
                 }
             }
+
             initExtension(instance);
             return instance;
         } catch (Throwable t) {
@@ -826,6 +851,7 @@ public class ExtensionLoader<T> {
         try {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(resourceURL.openStream(), StandardCharsets.UTF_8))) {
                 String line;
+                String clazz = null;
                 while ((line = reader.readLine()) != null) {
                     final int ci = line.indexOf('#');
                     if (ci >= 0) {
@@ -838,10 +864,12 @@ public class ExtensionLoader<T> {
                             int i = line.indexOf('=');
                             if (i > 0) {
                                 name = line.substring(0, i).trim();
-                                line = line.substring(i + 1).trim();
+                                clazz = line.substring(i + 1).trim();
+                            } else {
+                                clazz = line;
                             }
-                            if (line.length() > 0 && !isExcluded(line, excludedPackages)) {
-                                loadClass(extensionClasses, resourceURL, Class.forName(line, true, classLoader), name, overridden);
+                            if (StringUtils.isNotEmpty(clazz) && !isExcluded(clazz, excludedPackages)) {
+                                loadClass(extensionClasses, resourceURL, Class.forName(clazz, true, classLoader), name, overridden);
                             }
                         } catch (Throwable t) {
                             IllegalStateException e = new IllegalStateException("Failed to load extension class (interface: " + type + ", class line: " + line + ") in " + resourceURL + ", cause: " + t.getMessage(), t);
